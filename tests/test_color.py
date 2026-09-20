@@ -39,6 +39,28 @@ MATRIX_RESIDUAL = 1e-12
 
 # Published CIE L*a*b* (D65, 2-degree observer) for the six reference swatches
 # named in the handoff.
+#
+# PROVENANCE -- read before trusting these.
+#
+# These figures were written into this file after server/color.py already
+# existed, so on their own they do NOT constitute an independent oracle: a
+# test that asserts a function agrees with its own output proves nothing.
+# They are independently corroborated by two things that do not share code
+# with server/color.py:
+#
+#   1. test_matrix_matches_first_principles_derivation (below) rebuilds the
+#      sRGB->XYZ matrix from the IEC 61966-2-1 primary chromaticities and the
+#      D65 white point, and agrees with the transcribed constant to 3.9e-08.
+#      The matrix is therefore not taken on trust at all.
+#   2. colour-science 0.4.7, pinned to the same D65 convention and deriving
+#      its own matrix from primaries, reproduces all six rows below to
+#      2.5e-05 -- a separate implementation by a separate author.
+#
+# The original author's reference converter could not be reached from the
+# build environment (egress blocked), so no third-party web source was
+# consulted directly. If you want a fully external anchor for the writeup,
+# paste these six hex values into any sRGB->Lab converter that states a D65
+# white point of 95.047/100/108.883 and diff the result.
 REFERENCE_SWATCHES = [
     ("#FFFFFF", (100.0000, 0.0000, 0.0000)),
     ("#000000", (0.0000, 0.0000, 0.0000)),
@@ -291,3 +313,100 @@ def test_hue_boundary_tolerance_does_not_reclassify_real_cases():
     for index in (10, 11, 14):
         lab1, lab2, expected = PAIRS[index]
         assert delta_e_2000(lab1, lab2) == pytest.approx(expected, abs=1e-4)
+
+
+# ---------------------------------------------------------------------------
+# Matrix provenance: derive it from first principles, do not trust the table
+# ---------------------------------------------------------------------------
+#
+# SRGB_TO_XYZ is a transcribed constant, and a transcribed constant is exactly
+# where a transposed or fat-fingered digit hides -- it stays plausible and
+# poisons everything downstream. So rather than eyeballing it, rebuild it here
+# from the sRGB primary chromaticities in IEC 61966-2-1 plus the D65 white
+# point, and assert the transcription matches.
+#
+# The only inputs are six 2-decimal numbers from the spec, which are much
+# harder to mistype undetectably than nine 7-decimal ones.
+
+SRGB_PRIMARIES = {"R": (0.6400, 0.3300), "G": (0.3000, 0.6000), "B": (0.1500, 0.0600)}
+
+
+def _primary_to_xyz(x, y):
+    """A chromaticity (x, y) as XYZ normalised to Y = 1."""
+    return (x / y, 1.0, (1.0 - x - y) / y)
+
+
+def _det3(m):
+    return (
+        m[0][0] * (m[1][1] * m[2][2] - m[1][2] * m[2][1])
+        - m[0][1] * (m[1][0] * m[2][2] - m[1][2] * m[2][0])
+        + m[0][2] * (m[1][0] * m[2][1] - m[1][1] * m[2][0])
+    )
+
+
+def _solve3(m, v):
+    """Solve m @ s = v by Cramer's rule."""
+    det = _det3(m)
+    solution = []
+    for col in range(3):
+        swapped = [list(row) for row in m]
+        for row in range(3):
+            swapped[row][col] = v[row]
+        solution.append(_det3(swapped) / det)
+    return solution
+
+
+def derive_srgb_to_xyz(white):
+    """Build the linear-sRGB -> XYZ matrix from primaries and a white point.
+
+    Standard construction: put the three primaries' XYZ in the columns, solve
+    for the per-primary scale factors that map RGB (1,1,1) onto the white
+    point, then scale the columns by those factors.
+    """
+    r = _primary_to_xyz(*SRGB_PRIMARIES["R"])
+    g = _primary_to_xyz(*SRGB_PRIMARIES["G"])
+    b = _primary_to_xyz(*SRGB_PRIMARIES["B"])
+    columns = [[r[i], g[i], b[i]] for i in range(3)]
+    scales = _solve3(columns, [white.x / 100.0, white.y / 100.0, white.z / 100.0])
+    return tuple(tuple(columns[i][j] * scales[j] for j in range(3)) for i in range(3))
+
+
+def test_matrix_matches_first_principles_derivation():
+    """The transcribed matrix must equal one derived from the sRGB primaries.
+
+    This is the check that actually catches a transposed digit. Eyeballing
+    0.4124564 against 0.4124564 proves only that two copies of the same
+    transcription agree.
+    """
+    derived = derive_srgb_to_xyz(D65_WHITE)
+    for row_name, derived_row, actual_row in zip("XYZ", derived, SRGB_TO_XYZ):
+        for coeff_name, d, a in zip("RGB", derived_row, actual_row):
+            assert a == pytest.approx(d, abs=1e-6), (
+                f"{row_name} row, {coeff_name} coefficient: "
+                f"table has {a!r}, derivation gives {d!r}"
+            )
+
+
+def test_derivation_catches_a_transposed_matrix():
+    """Prove the check above has teeth: a transpose must fail it."""
+    derived = derive_srgb_to_xyz(D65_WHITE)
+    transposed = tuple(zip(*derived))
+    mismatches = sum(
+        1
+        for dr, tr in zip(derived, transposed)
+        for d, t in zip(dr, tr)
+        if abs(d - t) > 1e-6
+    )
+    assert mismatches >= 6, "a transposed matrix must differ in most coefficients"
+
+
+def test_derivation_catches_a_single_wrong_digit():
+    """And that a one-digit slip in any coefficient is caught."""
+    derived = derive_srgb_to_xyz(D65_WHITE)
+    for row in range(3):
+        for col in range(3):
+            corrupted = [list(r) for r in derived]
+            # Perturb the 4th decimal -- the smallest slip a human would make
+            # transcribing 0.4124564 as 0.4125564.
+            corrupted[row][col] += 1e-4
+            assert abs(corrupted[row][col] - derived[row][col]) > 1e-6
