@@ -2,10 +2,11 @@
 
 Flask + SQLite + color engine for the closet station.
 
-**Status: `color.py` only.** The conversion chain and CIEDE2000 are implemented
-and validated. `scoring.py`, `identify.py`, the DB schema and the Flask
-endpoints are not started yet — deliberately, because the handoff makes the
-color layer a gate for everything above it.
+**Status: `color.py` and `colorimetry.py`.** The conversion chain, CIEDE2000,
+and the sensor-side normalisation are implemented and validated. `scoring.py`,
+`identify.py`, the DB schema and the Flask endpoints are not started yet —
+deliberately, because the handoff makes the color layer a gate for everything
+above it.
 
 ## Running the tests
 
@@ -14,7 +15,7 @@ pip install -r requirements.txt
 python -m pytest -q
 ```
 
-65 tests, no dependencies beyond pytest. `color.py` is pure standard library.
+113 tests, no dependencies beyond pytest. Both modules are pure standard library.
 
 ## What `color.py` provides
 
@@ -27,9 +28,59 @@ python -m pytest -q
 | `lab_to_lch` / `lch_to_lab` | cylindrical form for harmony reasoning |
 | `delta_e_2000` | CIEDE2000 color difference |
 
-Not yet implemented, and intentionally so: normalising raw TCS34725 counts by
-the Clear channel and applying stored white-balance factors. Those are steps 1–3
-of the handoff's chain; they depend on the `calibration` table and land with it.
+## What `colorimetry.py` provides
+
+Steps 1–3 of the handoff's chain — the sensor side, which `color.py`
+deliberately left out.
+
+| Function | Purpose |
+|---|---|
+| `Calibration` | namedtuple of `wr` / `wg` / `wb` white-balance factors, defaulting to the identity |
+| `normalize` | raw 16-bit TCS34725 counts → 0–255 sRGB: divide by Clear, divide by the calibration factor, scale, clamp |
+| `rgb_to_lab` | 0–255 sRGB → CIELAB, composed over `color.py` |
+| `lab_to_lch` | re-exported from `color.py` |
+
+`rgb_to_lab` and `lab_to_lch` are thin compositions over `color.py` rather than
+a second copy of the matrix — the failure mode of a duplicated transform is a
+transposed row that yields plausible-looking wrong numbers, so there is exactly
+one implementation in the tree. `Calibration` and `normalize` are the new code.
+
+Still not implemented: persisting a `Calibration` (that lands with the
+`calibration` table), and everything above the color layer.
+
+### `normalize` and the zero-Clear guard
+
+`c == 0` means no light reached the sensor. `normalize` raises `ValueError`
+before any arithmetic runs, so a station log shows a named refusal rather than
+a `ZeroDivisionError` from the middle of the chain. The ordering is pinned
+structurally in `tests/test_colorimetry.py` by a tripwire calibration object
+whose factors raise on read — the test fails if the guard is moved even one
+statement later. Both mutations (guard deleted, guard moved) were confirmed to
+fail the suite.
+
+Note that the Clear division and the calibration division commute
+arithmetically, so no output can distinguish their order; what the tests pin is
+the composition, the exposure-invariance property the Clear division buys, and
+the guard ordering, which does have observable consequences.
+
+### Gate 3 — the `colorimetry.py` swatches
+
+`tests/test_colorimetry.py` runs eight hex swatches spanning the hue circle and
+the lightness range (the three primaries, orange, yellow, cyan, mid-grey and
+white) through `rgb_to_lab` at a tolerance of 0.5 per channel.
+
+Reference values were generated with **coloraide 8.12.1** via its `lab-d65`
+space; the exact reproducing command is in the file's PROVENANCE comment.
+coloraide derives its sRGB→XYZ matrix from the primary chromaticities rather
+than transcribing a table, so it shares no constants with `color.py` — the
+agreement is two independent derivations landing in the same place. It is a
+development-time oracle only and is **not** in `requirements.txt`.
+
+Worst deviation across all 24 components: **0.0086** (on `#00FFFF`'s a\*),
+against the 0.5 tolerance. The residual is the two rounding conventions
+described in the file: the D65 variant moves a\* and b\* only (L\* cannot
+move, since every D65 in circulation puts Yn at exactly 100.000), while the
+matrix derivation is what moves L\*.
 
 ## Gate 1 — the Lab conversion
 
