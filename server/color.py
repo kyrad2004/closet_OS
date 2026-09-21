@@ -1,13 +1,13 @@
-"""Color science for Closet OS: sRGB -> XYZ -> CIELAB -> LCh, and CIEDE2000.
+"""Color science for Closet OS: raw sensor counts -> sRGB -> XYZ -> CIELAB -> LCh.
 
 Pure standard library. No numpy, no external color library -- the conversion
-chain and the delta-E formula are hand-rolled here so the whole thing is
-inspectable and unit-testable in one file.
+chain is hand-rolled here so the whole thing is inspectable and unit-testable
+in one file.
 
-Scope note: this module currently covers the *colorimetric* half of the chain
-(sRGB -> Lab -> LCh -> dE2000). Sensor-side steps -- normalising raw TCS34725
-counts by the Clear channel and applying the user's stored white-balance
-factors -- are deliberately not here yet; they land with the calibration table.
+Scope note: this module covers the measurement path end to end, from the
+TCS34725's raw counts through to LCh. Color *difference* (CIEDE2000) is
+deliberately not here -- it is built and validated as its own step, against
+the Sharma et al. test vectors retained in tests/sharma_ciede2000.py.
 
 Conventions
 -----------
@@ -23,20 +23,23 @@ import math
 from typing import NamedTuple
 
 __all__ = [
+    "Calibration",
     "Lab",
     "LCh",
     "XYZ",
     "D65_WHITE",
+    "SRGB_MAX",
+    "normalize",
     "hex_to_srgb",
     "srgb_to_linear",
     "linear_to_srgb",
     "srgb_to_xyz",
     "xyz_to_lab",
     "srgb_to_lab",
+    "rgb_to_lab",
     "hex_to_lab",
     "lab_to_lch",
     "lch_to_lab",
-    "delta_e_2000",
 ]
 
 
@@ -60,6 +63,22 @@ class LCh(NamedTuple):
     l: float
     c: float
     h: float
+
+
+class Calibration(NamedTuple):
+    """Per-channel white-balance factors from a white-reference reading.
+
+    Each factor is the Clear-normalised ratio the sensor reports for a known
+    neutral card, so dividing a measurement's ratio by it maps that card back
+    onto equal R=G=B. Factors default to 1.0, the identity transform -- useful
+    for tests and for a station that has not been calibrated yet.
+
+    Persisting these is not implemented; that lands with the calibration table.
+    """
+
+    wr: float = 1.0
+    wg: float = 1.0
+    wb: float = 1.0
 
 
 # --------------------------------------------------------------------------
@@ -121,24 +140,68 @@ _SRGB_SLOPE = 12.92
 _SRGB_ALPHA = 0.055
 _SRGB_GAMMA = 2.4
 
-# 25**7, used twice in CIEDE2000.
-_POW_25_7 = 25.0 ** 7
+#: Full-scale sRGB component.
+SRGB_MAX = 255.0
 
-# Tolerance on the |h1' - h2'| == 180 branch boundary in CIEDE2000.
-#
-# When two hues are exactly antipodal the mean hue is genuinely ambiguous and
-# the formula's branch test sits precisely on the knife edge, so whether
-# atan2 returns 180.0 or 180.00000000000003 decides the answer. Sharma pairs
-# 10 and 14 are exactly there (measured margins -2.8e-14 and 0.0), and the
-# published values correspond to the "<= 180" branch. Without a tolerance the
-# result depends on the platform's libm: numpy takes the other branch on
-# Linux, which is why colour-science excludes pair 14 from its test suite.
-#
-# 1e-10 is ~4 orders of magnitude above the float noise at the boundary and
-# ~7 below the nearest genuinely-over-180 case in the dataset (pair 11, at
-# +1.5e-3), so it disambiguates the degenerate case without reclassifying any
-# real one.
-_HUE_BOUNDARY_TOL = 1e-10
+
+# --------------------------------------------------------------------------
+# Raw sensor counts -> sRGB
+# --------------------------------------------------------------------------
+
+def normalize(r: float, g: float, b: float, c: float, cal: Calibration):
+    """Convert raw TCS34725 counts to 0-255 sRGB.
+
+    The chain, in order:
+
+    1. Divide each of ``r``, ``g``, ``b`` by the Clear channel ``c``. This is
+       what makes the reading independent of exposure and ambient level -- two
+       measurements of the same garment under different light produce the same
+       ratios even though every raw count changed.
+    2. Divide each ratio by its calibration factor (``cal.wr`` / ``cal.wg`` /
+       ``cal.wb``), which pulls the sensor's spectral response and the LED's
+       tint back onto neutral.
+    3. Scale to 0-255 and clamp to that range.
+
+    Steps 1 and 2 are both divisions, so arithmetically they commute; the order
+    is stated because step 3's clamp does *not* commute with them, and because
+    a calibration factor only means anything as a ratio against Clear.
+
+    ``c == 0`` means the sensor saw no light at all -- a dead LED, a covered
+    aperture, or an integration cycle that never ran. There is no reading to
+    salvage, so this raises before any arithmetic happens rather than letting
+    a ZeroDivisionError surface from the middle of the chain.
+
+    Returns floats, not ints. Rounding is the caller's decision: the Lab
+    conversion downstream is happier with the full precision, and quantising
+    here would throw away resolution the sensor actually has.
+
+    :raises ValueError: if ``c`` is zero or negative, or if any calibration
+        factor is zero or negative.
+    """
+    # Guard first -- before reading `cal`, before any division. The tests pin
+    # this ordering, because "ValueError" and "ZeroDivisionError from three
+    # lines deeper" are very different things to debug from a station log.
+    if c <= 0:
+        raise ValueError(
+            f"clear channel must be positive, got {c!r}; "
+            "a zero Clear reading means no light reached the sensor"
+        )
+    if cal.wr <= 0 or cal.wg <= 0 or cal.wb <= 0:
+        raise ValueError(f"calibration factors must be positive, got {cal!r}")
+
+    return tuple(
+        _clamp_srgb(SRGB_MAX * (raw / c) / factor)
+        for raw, factor in ((r, cal.wr), (g, cal.wg), (b, cal.wb))
+    )
+
+
+def _clamp_srgb(value: float) -> float:
+    """Clamp to the representable sRGB range."""
+    if value < 0.0:
+        return 0.0
+    if value > SRGB_MAX:
+        return SRGB_MAX
+    return value
 
 
 # --------------------------------------------------------------------------
@@ -197,9 +260,26 @@ def xyz_to_lab(x: float, y: float, z: float, white: XYZ = D65_WHITE) -> Lab:
     return Lab(116.0 * fy - 16.0, 500.0 * (fx - fy), 200.0 * (fy - fz))
 
 
-def srgb_to_lab(r: float, g: float, b: float) -> Lab:
-    """Convert 0-255 sRGB straight through to CIE L*a*b*."""
-    return xyz_to_lab(*srgb_to_xyz(r, g, b))
+def srgb_to_lab(r: float, g: float, b: float, white: XYZ = D65_WHITE) -> Lab:
+    """Convert 0-255 sRGB straight through to CIE L*a*b*.
+
+    Three stages: the sRGB gamma linearisation (IEC 61966-2-1), the
+    linear-sRGB -> XYZ matrix, and the XYZ -> Lab nonlinear compression.
+
+    ``white`` defaults to D65 (95.047, 100.000, 108.883). The matrix in stage
+    two is itself D65-referenced, so passing a different white here adapts
+    only the final compression -- it is the right knob for comparing against a
+    converter that quotes a different D65 rounding, not for a genuine change
+    of illuminant. Note also that it cannot move L*: that is
+    ``116*f(Y/Yn) - 16`` and every D65 in circulation puts Yn at exactly
+    100.000, so only a* and b* respond.
+    """
+    return xyz_to_lab(*srgb_to_xyz(r, g, b), white=white)
+
+
+#: Spelling of :func:`srgb_to_lab` used by the measurement path, where the
+#: input has come from :func:`normalize` rather than from a hex literal.
+rgb_to_lab = srgb_to_lab
 
 
 def hex_to_lab(value: str) -> Lab:
@@ -227,134 +307,3 @@ def lch_to_lab(l: float, c: float, h: float) -> Lab:
     """Inverse of :func:`lab_to_lch`."""
     rad = math.radians(h)
     return Lab(l, c * math.cos(rad), c * math.sin(rad))
-
-
-# --------------------------------------------------------------------------
-# CIEDE2000
-# --------------------------------------------------------------------------
-
-def _hue_prime(a_prime: float, b: float) -> float:
-    """Hue angle in [0, 360) for the a'-adjusted coordinates.
-
-    Per Sharma et al., the angle is defined as 0 when both components are 0
-    (``atan2(0, 0)`` is 0 in IEEE terms anyway, but being explicit documents
-    that this is a deliberate convention and not an accident).
-    """
-    if a_prime == 0.0 and b == 0.0:
-        return 0.0
-    return math.degrees(math.atan2(b, a_prime)) % 360.0
-
-
-def delta_e_2000(
-    lab1: tuple[float, float, float],
-    lab2: tuple[float, float, float],
-    k_l: float = 1.0,
-    k_c: float = 1.0,
-    k_h: float = 1.0,
-) -> float:
-    """CIEDE2000 color difference between two CIELAB colors.
-
-    Implemented from Sharma, Wu & Dalal (2005), "The CIEDE2000 color-difference
-    formula: Implementation notes, supplementary test data, and mathematical
-    observations", Color Research & Application 30(1), 21-30.
-
-    The four traps that paper calls out are handled explicitly and each is
-    covered by the Sharma test vectors in tests/test_color.py:
-
-    1. ``dh'`` quadrant selection -- the +/-360 wrap below.
-    2. ``hbar'`` when the two hues straddle 0/360 -- the ``h_sum < 360`` branch.
-    3. ``C1' * C2' == 0`` degenerate cases -- ``dh'`` forced to 0 and ``hbar'``
-       taken as the plain sum, so a neutral never injects a bogus hue term.
-    4. The sign of ``R_T`` -- it is negative, and it multiplies the *scaled*
-       chroma and hue terms, not the raw deltas.
-
-    A fifth trap the paper implies but does not spell out: the ``<= 180``
-    branch tests are exactly on a knife edge for antipodal hues. See
-    ``_HUE_BOUNDARY_TOL``.
-    """
-    l1, a1, b1 = lab1
-    l2, a2, b2 = lab2
-
-    # --- Step 1: chroma, and the a* expansion that pulls near-neutrals apart --
-    c1_ab = math.hypot(a1, b1)
-    c2_ab = math.hypot(a2, b2)
-    c_bar_ab_7 = (0.5 * (c1_ab + c2_ab)) ** 7
-    g = 0.5 * (1.0 - math.sqrt(c_bar_ab_7 / (c_bar_ab_7 + _POW_25_7)))
-
-    a1p = (1.0 + g) * a1
-    a2p = (1.0 + g) * a2
-
-    c1p = math.hypot(a1p, b1)
-    c2p = math.hypot(a2p, b2)
-
-    h1p = _hue_prime(a1p, b1)
-    h2p = _hue_prime(a2p, b2)
-
-    # --- Step 2: the deltas ------------------------------------------------
-    delta_lp = l2 - l1
-    delta_cp = c2p - c1p
-
-    c_product = c1p * c2p
-
-    # Trap 1 + trap 3: pick the dh' representative in (-180, 180]; if either
-    # color is neutral there is no meaningful hue difference at all.
-    if c_product == 0.0:
-        delta_hp = 0.0
-    else:
-        diff = h2p - h1p
-        if abs(diff) <= 180.0 + _HUE_BOUNDARY_TOL:
-            delta_hp = diff
-        elif diff > 180.0:
-            delta_hp = diff - 360.0
-        else:
-            delta_hp = diff + 360.0
-
-    delta_cap_hp = 2.0 * math.sqrt(c_product) * math.sin(math.radians(delta_hp) / 2.0)
-
-    # --- Step 3: the weighting functions -----------------------------------
-    l_bar_p = 0.5 * (l1 + l2)
-    c_bar_p = 0.5 * (c1p + c2p)
-
-    # Trap 2 + trap 3: mean hue has to cross the 0/360 seam the short way.
-    if c_product == 0.0:
-        h_bar_p = h1p + h2p
-    else:
-        h_sum = h1p + h2p
-        if abs(h1p - h2p) <= 180.0 + _HUE_BOUNDARY_TOL:
-            h_bar_p = h_sum / 2.0
-        elif h_sum < 360.0:
-            h_bar_p = (h_sum + 360.0) / 2.0
-        else:
-            h_bar_p = (h_sum - 360.0) / 2.0
-
-    t = (
-        1.0
-        - 0.17 * math.cos(math.radians(h_bar_p - 30.0))
-        + 0.24 * math.cos(math.radians(2.0 * h_bar_p))
-        + 0.32 * math.cos(math.radians(3.0 * h_bar_p + 6.0))
-        - 0.20 * math.cos(math.radians(4.0 * h_bar_p - 63.0))
-    )
-
-    delta_theta = 30.0 * math.exp(-(((h_bar_p - 275.0) / 25.0) ** 2))
-    c_bar_p_7 = c_bar_p ** 7
-    r_c = 2.0 * math.sqrt(c_bar_p_7 / (c_bar_p_7 + _POW_25_7))
-
-    # Trap 4: R_T is negative.
-    r_t = -math.sin(math.radians(2.0 * delta_theta)) * r_c
-
-    l_offset_sq = (l_bar_p - 50.0) ** 2
-    s_l = 1.0 + (0.015 * l_offset_sq) / math.sqrt(20.0 + l_offset_sq)
-    s_c = 1.0 + 0.045 * c_bar_p
-    s_h = 1.0 + 0.015 * c_bar_p * t
-
-    # --- Step 4: combine ----------------------------------------------------
-    term_l = delta_lp / (k_l * s_l)
-    term_c = delta_cp / (k_c * s_c)
-    term_h = delta_cap_hp / (k_h * s_h)
-
-    return math.sqrt(
-        term_l * term_l
-        + term_c * term_c
-        + term_h * term_h
-        + r_t * term_c * term_h
-    )

@@ -2,11 +2,11 @@
 
 Flask + SQLite + color engine for the closet station.
 
-**Status: `color.py` and `colorimetry.py`.** The conversion chain, CIEDE2000,
-and the sensor-side normalisation are implemented and validated. `scoring.py`,
-`identify.py`, the DB schema and the Flask endpoints are not started yet —
-deliberately, because the handoff makes the color layer a gate for everything
-above it.
+**Status: `color.py` only.** The measurement path is implemented and
+validated: raw sensor counts through normalisation, sRGB, CIELAB and LCh.
+CIEDE2000, `scoring.py`, `identify.py`, the DB schema and the Flask endpoints
+are not started yet — deliberately, because the color layer is a gate for
+everything above it.
 
 ## Running the tests
 
@@ -15,72 +15,36 @@ pip install -r requirements.txt
 python -m pytest -q
 ```
 
-113 tests, no dependencies beyond pytest. Both modules are pure standard library.
+53 tests, no dependencies beyond pytest. `color.py` is pure standard library.
 
 ## What `color.py` provides
 
 | Function | Purpose |
 |---|---|
+| `Calibration` | namedtuple of `wr` / `wg` / `wb` white-balance factors, defaulting to the identity |
+| `normalize` | raw 16-bit TCS34725 counts → 0–255 sRGB: divide by Clear, divide by the calibration factor, scale, clamp |
 | `hex_to_srgb` / `srgb_to_linear` / `linear_to_srgb` | sRGB plumbing (IEC 61966-2-1) |
 | `srgb_to_xyz` | linear sRGB → XYZ, D65, scaled 0–100 |
 | `xyz_to_lab` | XYZ → CIE L\*a\*b\* |
-| `srgb_to_lab` / `hex_to_lab` | the whole chain in one call |
+| `srgb_to_lab` / `rgb_to_lab` / `hex_to_lab` | the whole chain in one call |
 | `lab_to_lch` / `lch_to_lab` | cylindrical form for harmony reasoning |
-| `delta_e_2000` | CIEDE2000 color difference |
-
-## What `colorimetry.py` provides
-
-Steps 1–3 of the handoff's chain — the sensor side, which `color.py`
-deliberately left out.
-
-| Function | Purpose |
-|---|---|
-| `Calibration` | namedtuple of `wr` / `wg` / `wb` white-balance factors, defaulting to the identity |
-| `normalize` | raw 16-bit TCS34725 counts → 0–255 sRGB: divide by Clear, divide by the calibration factor, scale, clamp |
-| `rgb_to_lab` | 0–255 sRGB → CIELAB, composed over `color.py` |
-| `lab_to_lch` | re-exported from `color.py` |
-
-`rgb_to_lab` and `lab_to_lch` are thin compositions over `color.py` rather than
-a second copy of the matrix — the failure mode of a duplicated transform is a
-transposed row that yields plausible-looking wrong numbers, so there is exactly
-one implementation in the tree. `Calibration` and `normalize` are the new code.
-
-Still not implemented: persisting a `Calibration` (that lands with the
-`calibration` table), and everything above the color layer.
 
 ### `normalize` and the zero-Clear guard
 
 `c == 0` means no light reached the sensor. `normalize` raises `ValueError`
 before any arithmetic runs, so a station log shows a named refusal rather than
 a `ZeroDivisionError` from the middle of the chain. The ordering is pinned
-structurally in `tests/test_colorimetry.py` by a tripwire calibration object
-whose factors raise on read — the test fails if the guard is moved even one
-statement later. Both mutations (guard deleted, guard moved) were confirmed to
-fail the suite.
+structurally by a tripwire calibration object whose factors raise on read — the
+test fails if the guard is moved even one statement later.
 
 Note that the Clear division and the calibration division commute
 arithmetically, so no output can distinguish their order; what the tests pin is
-the composition, the exposure-invariance property the Clear division buys, and
-the guard ordering, which does have observable consequences.
+the composition, the exposure-invariance property the Clear division buys (scale
+all four counts, get the same answer), and the guard ordering, which does have
+observable consequences.
 
-### Gate 3 — the `colorimetry.py` swatches
-
-`tests/test_colorimetry.py` runs eight hex swatches spanning the hue circle and
-the lightness range (the three primaries, orange, yellow, cyan, mid-grey and
-white) through `rgb_to_lab` at a tolerance of 0.5 per channel.
-
-Reference values were generated with **coloraide 8.12.1** via its `lab-d65`
-space; the exact reproducing command is in the file's PROVENANCE comment.
-coloraide derives its sRGB→XYZ matrix from the primary chromaticities rather
-than transcribing a table, so it shares no constants with `color.py` — the
-agreement is two independent derivations landing in the same place. It is a
-development-time oracle only and is **not** in `requirements.txt`.
-
-Worst deviation across all 24 components: **0.0086** (on `#00FFFF`'s a\*),
-against the 0.5 tolerance. The residual is the two rounding conventions
-described in the file: the D65 variant moves a\* and b\* only (L\* cannot
-move, since every D65 in circulation puts Yn at exactly 100.000), while the
-matrix derivation is what moves L\*.
+Still not implemented: persisting a `Calibration` — that lands with the
+`calibration` table.
 
 ## Gate 1 — the Lab conversion
 
@@ -123,67 +87,43 @@ chroma-sensitive distance, so an exactly-neutral axis is worth having as a
 structural guarantee. After normalisation, neutrality holds to 5.6e-14 and no
 reference swatch moves at 4 decimal places.
 
-## Gate 2 — CIEDE2000
+## CIEDE2000 — deferred, with its dataset retained
 
-Hand-rolled from Sharma, Wu & Dalal (2005), *The CIEDE2000 color-difference
-formula: Implementation notes, supplementary test data, and mathematical
-observations*, Color Research & Application 30(1), 21–30. **No library is used
-at runtime** — `colour-science` appears only as a development-time cross-check
-and is not in `requirements.txt`.
+`delta_e_2000` is **not implemented**. It is built and validated as its own
+step, against the Sharma et al. published test vectors.
 
-Validated against **all 34 published test vectors**, in
-`tests/sharma_ciede2000.py`. Every one agrees to 4 decimal places; worst
-deviation **4.95e-05**, and all 34 round exactly to the published figure.
-
-### Dataset provenance — read this
-
-The author's original host (`www2.ece.rochester.edu`, `hajim.rochester.edu`)
-was **unreachable from the build environment** — DNS failure on the first, and
-the egress proxy refused the second. The table was therefore reconstructed from
-two independent published transcriptions and cross-checked field by field:
+`tests/sharma_ciede2000.py` — all 34 vectors — is **retained and unused**,
+deliberately. It is worth more than the code it will validate: the author's
+original host (`www2.ece.rochester.edu`, `hajim.rochester.edu`) is unreachable
+from this build environment (DNS failure on the first, egress proxy refusal on
+the second), so the table was reconstructed from two independent published
+transcriptions and cross-checked field by field:
 
 * `colour-science` 0.4.7 — `colour/difference/tests/test_delta_e.py`
 * `coloraide` 8.12.1 — `tests/test_distance.py`
 
 All 33 rows the two sources share agree to within 1e-9 on every field. They
-differ only on pair 14, and in a way that resolves cleanly:
+differ only on pair 14, and in a way that resolves cleanly: `colour-science`
+**excludes** it (platform-dependent `arctan2`) but records its values verbatim
+in a comment, while `coloraide` includes it but typos the sample a\* as
+`0.00010`. The file uses `0.0010`, which is what the colour-science comment
+records and what the 0.0009 / 0.0010 / 0.0011 / 0.0012 progression across pairs
+13–16 requires.
 
-* `colour-science` **excludes** pair 14 (platform-dependent `arctan2`), but
-  records its values verbatim in a comment.
-* `coloraide` includes it but typos the sample a\* as `0.00010`.
+**This is a second-hand transcription, not the primary file.** If you want the
+primary artifact for the writeup, fetch `CIEDE2000.txt` from Sharma's page on a
+machine with open networking and diff it against `tests/sharma_ciede2000.py`.
 
-We use `0.0010`, which is what the colour-science comment records and what the
-0.0009 / 0.0010 / 0.0011 / 0.0012 progression across pairs 13–16 requires.
+### Known traps, for when this is built
 
-**This is a second-hand transcription, not the primary file.** It is
-corroborated by two independent sources plus an independent implementation
-(below), which is strong, but if you want the primary artifact for the writeup,
-fetch `CIEDE2000.txt` from Sharma's page on a machine with open networking and
-diff it against `tests/sharma_ciede2000.py`.
-
-### Independent implementation cross-check
-
-Our `delta_e_2000` agrees with `colour-science` 0.4.7:
-
-* **exactly (0.0 difference)** on all 34 Sharma pairs
-* to **1.7e-13** over 20,000 random Lab pairs
-
-### The antipodal-hue trap
-
-Sharma pairs 10 and 14 have hues *exactly* 180° apart, where the formula's
-`|h1' − h2'| <= 180` branch test sits on a knife edge and the answer is decided
-by libm rounding. `numpy.arctan2` lands on the other branch on Linux and
-returns 4.7461 instead of the published 4.8045 — which is precisely why
-`colour-science` drops pair 14 from its own suite.
-
-`color.py` applies a 1e-10 tolerance to that comparison (`_HUE_BOUNDARY_TOL`).
-Measured margins in the dataset: the two degenerate pairs sit at 0.0 and
-−2.8e-14 from the boundary, and the nearest genuinely-past-180 case (pair 11)
-sits at +1.5e-3. The tolerance therefore has ~4 orders of magnitude of headroom
-above the float noise and ~7 below any real case, so it makes the degenerate
-pairs deterministic across platforms without reclassifying anything. Both
-directions are pinned by tests.
-
-All four traps the paper names — `dhp` quadrant selection, `hbarp` across the
-0°/360° seam, the `C1'·C2' == 0` degenerate cases, and the sign of `RT` — are
-handled explicitly and commented in place.
+Recorded here so they are not rediscovered the hard way. The paper names four:
+`dhp` quadrant selection, `hbarp` across the 0°/360° seam, the `C1'·C2' == 0`
+degenerate cases, and the sign of `RT`. A fifth it only implies: Sharma pairs 10
+and 14 have hues *exactly* 180° apart, where the `|h1' - h2'| <= 180` branch
+test sits on a knife edge and the answer is decided by libm rounding —
+`numpy.arctan2` lands on the other branch on Linux and returns 4.7461 instead of
+the published 4.8045, which is precisely why `colour-science` drops pair 14 from
+its own suite. A small tolerance (~1e-10) on that comparison makes the
+degenerate pairs deterministic across platforms without reclassifying anything:
+the two degenerate pairs sit at 0.0 and −2.8e-14 from the boundary, and the
+nearest genuinely-past-180 case (pair 11) sits at +1.5e-3.

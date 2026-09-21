@@ -2,10 +2,15 @@
 
 Two gates live here, in this order:
 
-1. The sRGB -> XYZ -> CIELAB chain against six published reference swatches.
+1. The sRGB -> XYZ -> CIELAB chain against published reference swatches.
    Nothing downstream (scoring, identify) may be trusted until this passes --
    a transposed matrix row produces plausible-looking wrong numbers.
-2. CIEDE2000 against all 34 Sharma et al. (2005) test vectors to 4 decimals.
+2. `normalize`: the raw-counts contract. Clear-normalise, then calibrate,
+   then clamp -- and refuse a zero Clear reading before dividing by it.
+
+CIEDE2000 is not covered here because it is not implemented yet. The Sharma
+et al. test vectors it will be validated against are retained, unused, in
+tests/sharma_ciede2000.py.
 """
 
 from __future__ import annotations
@@ -16,18 +21,21 @@ import pytest
 
 from server.color import (
     D65_WHITE,
+    SRGB_MAX,
     SRGB_TO_XYZ,
-    delta_e_2000,
+    XYZ,
+    Calibration,
     hex_to_lab,
     hex_to_srgb,
     lab_to_lch,
     lch_to_lab,
     linear_to_srgb,
+    normalize,
+    rgb_to_lab,
     srgb_to_lab,
     srgb_to_linear,
     srgb_to_xyz,
 )
-from tests.sharma_ciede2000 import PAIRS
 
 # Tolerance for the swatch fixtures: the published values are quoted to 4
 # decimals, so anything beyond 1e-4 is a real disagreement, not rounding.
@@ -200,6 +208,15 @@ def test_lab_to_lch_neutral_hue_is_zero():
     assert lch.h == 0.0
 
 
+def test_lch_hue_stays_in_range_around_the_circle():
+    """Sweep the circle; no angle may land outside [0, 360)."""
+    for degrees in range(0, 360, 5):
+        rad = math.radians(degrees)
+        h = lab_to_lch(50.0, 25.0 * math.cos(rad), 25.0 * math.sin(rad)).h
+        assert 0.0 <= h < 360.0
+        assert h == pytest.approx(float(degrees), abs=1e-9)
+
+
 def test_lch_round_trip():
     for lab in [(53.2408, 80.0925, 67.2032), (32.2970, 79.1875, -107.8602),
                 (87.7347, -86.1827, 83.1793), (50.0, -1.0, 2.0)]:
@@ -215,104 +232,291 @@ def test_red_hue_angle_is_plausible():
 
 
 # ---------------------------------------------------------------------------
-# Gate 2: CIEDE2000 against Sharma et al.
+# Gate 1b: an extended swatch set, from an independent oracle
 # ---------------------------------------------------------------------------
+#
+# The six fixtures above are pinned at 1e-4 but were transcribed after
+# color.py existed, so they lean on the first-principles matrix derivation at
+# the bottom of this file for their independence. This second set is a
+# straightforwardly external cross-check, and it widens the coverage to hues
+# the primaries miss -- orange and yellow in the +a*/+b* quadrant, cyan with
+# both axes negative.
+#
+# PROVENANCE -- this is the part to be able to explain.
+#
+# Generated with coloraide 8.12.1 (a pure-Python color library, independent of
+# this codebase and by a different author), via its `lab-d65` space. Exact
+# command, reproducible from a clean environment:
+#
+#     pip install coloraide==8.12.1
+#     python -c "
+#     from coloraide import Color
+#     for h in ['#FF0000','#00FF00','#0000FF','#FFA500','#FFFF00',
+#               '#00FFFF','#808080','#FFFFFF']:
+#         c = Color(h).convert('lab-d65')
+#         print(h, round(c['lightness'],4), round(c['a'],4), round(c['b'],4))
+#     "
+#
+# coloraide is a development-time oracle only. It is NOT in requirements.txt
+# and nothing at runtime imports it -- these are transcribed constants, so the
+# suite stays pure-stdlib-plus-pytest.
+#
+# It earns the name "independent": coloraide derives its sRGB->XYZ matrix from
+# the primary chromaticities rather than transcribing a published table, so it
+# shares no constants with server/color.py. Agreement here is two separate
+# derivations landing in the same place.
+#
+# Tolerance is 0.5 per channel against a measured worst case of 0.0086, and
+# the headroom is deliberate: two rounding conventions move these numbers in
+# the third decimal.
+#
+#   * The D65 rounding. This codebase uses the ASTM 95.047/100/108.883; most
+#     libraries derive 95.0456/100/108.9058 from the (0.3127, 0.3290)
+#     chromaticity. This shifts a* and b* only -- L* is 116*f(Y/Yn) - 16 and
+#     Yn is 100.000 either way, so L* cannot move.
+#   * The sRGB->XYZ matrix. A transcribed 7-decimal table and a matrix derived
+#     from the primary chromaticities differ around the 7th decimal, which is
+#     what moves L* (#FF0000 sits at 53.2408 here against coloraide's 53.2371).
+#
+# A fixture that fails at 0.5 is a real error -- a transposed row, a missing
+# gamma step -- not a convention mismatch.
+CORROBORATING_SWATCHES = [
+    ("#FF0000", (53.2371, 80.0901, 67.2033)),     # primary red
+    ("#00FF00", (87.7355, -86.1816, 83.1866)),    # primary green, high L*
+    ("#0000FF", (32.3009, 79.1953, -107.8555)),   # primary blue, low L*
+    ("#FFA500", (74.9339, 23.9269, 78.9530)),     # saturated orange
+    ("#FFFF00", (97.1386, -21.5600, 94.4838)),    # yellow, near-max L*
+    ("#00FFFF", (91.1148, -48.0789, -14.1290)),   # cyan, negative a* and b*
+    ("#808080", (53.5850, 0.0000, 0.0000)),       # mid-grey, must be neutral
+    ("#FFFFFF", (100.0000, 0.0000, 0.0000)),      # white point itself
+]
 
-def test_sharma_dataset_is_complete():
-    assert len(PAIRS) == 34
+CORROBORATING_TOL = 0.5
 
 
 @pytest.mark.parametrize(
-    "lab1,lab2,expected",
-    PAIRS,
-    ids=[f"pair{i:02d}" for i in range(1, len(PAIRS) + 1)],
+    "hex_value,expected",
+    CORROBORATING_SWATCHES,
+    ids=[h for h, _ in CORROBORATING_SWATCHES],
 )
-def test_delta_e_2000_sharma(lab1, lab2, expected):
-    """All 34 published vectors, to 4 decimal places."""
-    got = delta_e_2000(lab1, lab2)
-    assert got == pytest.approx(expected, abs=1e-4), (
-        f"{lab1} vs {lab2}: got {got:.6f}, published {expected:.4f}"
+def test_corroborating_swatch_lab(hex_value, expected):
+    """Eight swatches against coloraide, within CORROBORATING_TOL."""
+    got = rgb_to_lab(*hex_to_srgb(hex_value))
+    for channel, actual, want in zip("Lab", got, expected):
+        assert actual == pytest.approx(want, abs=CORROBORATING_TOL), (
+            f"{hex_value} {channel}*: got {actual:.4f}, expected {want:.4f}"
+        )
+
+
+def test_corroborating_agreement_is_far_tighter_than_the_tolerance():
+    """Document the real margin, so a slow drift toward 0.5 stays visible.
+
+    If this fails while the parametrized tests above still pass, the chain has
+    moved: something is eating the headroom that makes 0.5 safe. Worth knowing
+    before it becomes a failure.
+    """
+    worst = max(
+        abs(actual - want)
+        for hex_value, expected in CORROBORATING_SWATCHES
+        for actual, want in zip(rgb_to_lab(*hex_to_srgb(hex_value)), expected)
+    )
+    assert worst < 0.02, f"worst channel deviation {worst:.6f} -- chain drifted"
+
+
+def test_white_argument_moves_a_and_b_but_not_l():
+    """The white point must reach a* and b*, and must not reach L*.
+
+    L* is 116*f(Y/Yn) - 16, and every D65 variant in circulation puts Yn at
+    exactly 100.000, so swapping white points cannot move lightness -- only
+    the X and Z denominators change. A `white` argument that shifted L* would
+    mean it had been wired into the wrong place in the chain.
+    """
+    chromaticity_d65 = XYZ(95.0456, 100.000, 108.9058)
+    default = rgb_to_lab(255, 0, 0)
+    shifted = rgb_to_lab(255, 0, 0, white=chromaticity_d65)
+
+    assert shifted.l == pytest.approx(default.l, abs=1e-12)
+    assert shifted.a != default.a
+    assert shifted.b != default.b
+    # The shift is small but real: a rounding of the same illuminant.
+    assert shifted.a == pytest.approx(default.a, abs=0.01)
+    assert shifted.b == pytest.approx(default.b, abs=0.01)
+
+
+def test_default_white_is_the_astm_d65():
+    """The documented default, pinned so a silent swap shows up here."""
+    assert tuple(D65_WHITE) == (95.047, 100.000, 108.883)
+    assert rgb_to_lab(255, 0, 0) == pytest.approx(
+        rgb_to_lab(255, 0, 0, white=D65_WHITE)
     )
 
 
-def test_delta_e_2000_sharma_rounds_exactly():
-    """Stronger claim: every value rounds to the published 4-decimal figure."""
-    off = [
-        (i, round(delta_e_2000(a, b), 4), e)
-        for i, (a, b, e) in enumerate(PAIRS, 1)
-        if round(delta_e_2000(a, b), 4) != e
-    ]
-    assert not off, f"rows not matching at 4dp: {off}"
-
-
 # ---------------------------------------------------------------------------
-# CIEDE2000 properties
+# Gate 2: normalize -- raw counts to sRGB
 # ---------------------------------------------------------------------------
 
-def test_delta_e_identity_is_zero():
-    for lab, _, _ in PAIRS:
-        assert delta_e_2000(lab, lab) == pytest.approx(0.0, abs=1e-12)
+def test_normalize_divides_by_clear():
+    """With identity calibration the result is exactly 255 * raw / clear."""
+    got = normalize(1000, 2000, 3000, 4000, Calibration())
+    assert got == pytest.approx((63.75, 127.5, 191.25))
 
 
-def test_delta_e_is_symmetric():
-    for lab1, lab2, _ in PAIRS:
-        assert delta_e_2000(lab1, lab2) == pytest.approx(delta_e_2000(lab2, lab1), abs=1e-12)
+def test_normalize_is_invariant_to_exposure():
+    """The Clear division is what this buys: scale every count, same answer.
 
-
-def test_delta_e_is_non_negative():
-    for lab1, lab2, _ in PAIRS:
-        assert delta_e_2000(lab1, lab2) >= 0.0
-
-
-def test_delta_e_monotonic_along_lightness_ramp():
-    base = (50.0, 0.0, 0.0)
-    deltas = [delta_e_2000(base, (50.0 + step, 0.0, 0.0)) for step in range(0, 46)]
-    assert all(b > a for a, b in zip(deltas, deltas[1:]))
-
-
-def test_delta_e_handles_neutral_pair_without_hue_term():
-    """Both colors neutral: C1' * C2' == 0, so only the lightness term survives."""
-    d = delta_e_2000((50.0, 0.0, 0.0), (60.0, 0.0, 0.0))
-    s_l = 1.0 + (0.015 * 25.0) / math.sqrt(20.0 + 25.0)
-    assert d == pytest.approx(10.0 / s_l, abs=1e-12)
-
-
-def test_delta_e_one_neutral_one_chromatic_is_finite():
-    d = delta_e_2000((50.0, 0.0, 0.0), (50.0, 30.0, 40.0))
-    assert math.isfinite(d) and d > 0.0
-
-
-def test_delta_e_hue_wraparound_is_short_way_round():
-    """Hues at 1 deg and 359 deg are 2 deg apart, not 358."""
-    near = lch_to_lab(50.0, 20.0, 1.0)
-    far = lch_to_lab(50.0, 20.0, 359.0)
-    straddle = delta_e_2000(near, far)
-    same_side = delta_e_2000(lch_to_lab(50.0, 20.0, 179.0), lch_to_lab(50.0, 20.0, 181.0))
-    assert straddle == pytest.approx(same_side, rel=0.35)
-    assert straddle < 2.0
-
-
-def test_antipodal_hue_branch_is_platform_independent():
-    """Sharma pairs 10 and 14 sit exactly on the |h1'-h2'| == 180 boundary.
-
-    Both must take the documented "<= 180" branch. Without the tolerance in
-    color._HUE_BOUNDARY_TOL this is decided by libm rounding -- numpy lands on
-    the other branch on Linux and returns 4.7461 for pair 14, which is why
-    colour-science drops that pair from its own test suite.
+    This is the property that distinguishes normalising by Clear from just
+    rescaling raw counts. Doubling the integration time doubles all four
+    channels; the garment did not change color, so neither may the output.
     """
-    lab1, lab2, expected = PAIRS[13]
-    assert expected == 4.8045
-    assert delta_e_2000(lab1, lab2) == pytest.approx(4.8045, abs=1e-4)
+    cal = Calibration(wr=0.9, wg=1.0, wb=1.1)
+    base = normalize(1000, 2000, 3000, 8000, cal)
+    for factor in (2, 3, 7):
+        scaled = normalize(1000 * factor, 2000 * factor, 3000 * factor,
+                           8000 * factor, cal)
+        assert scaled == pytest.approx(base)
 
-    lab1, lab2, expected = PAIRS[9]
-    assert delta_e_2000(lab1, lab2) == pytest.approx(expected, abs=1e-4)
+
+def test_normalize_matches_the_composed_formula():
+    """Pin the whole chain: Clear-normalise, then calibrate, then scale.
+
+    Steps 1 and 2 are both divisions and therefore commute arithmetically, so
+    no output can distinguish "divide by c then by w" from "divide by w then
+    by c". What this asserts is the composition itself -- that both divisions
+    happen, each exactly once, against the right operand. The *ordering*
+    guarantee that does have observable consequences is the zero-Clear guard
+    running before either division, pinned below.
+    """
+    cal = Calibration(wr=0.8, wg=1.25, wb=0.5)
+    r, g, b, c = 1200, 3000, 900, 10000
+    expected = (
+        SRGB_MAX * (r / c) / cal.wr,
+        SRGB_MAX * (g / c) / cal.wg,
+        SRGB_MAX * (b / c) / cal.wb,
+    )
+    assert normalize(r, g, b, c, cal) == pytest.approx(expected)
 
 
-def test_hue_boundary_tolerance_does_not_reclassify_real_cases():
-    """Pairs 11, 12 and 15 are genuinely past 180 and must stay that way."""
-    for index in (10, 11, 14):
-        lab1, lab2, expected = PAIRS[index]
-        assert delta_e_2000(lab1, lab2) == pytest.approx(expected, abs=1e-4)
+def test_calibration_is_applied_to_the_clear_ratio_not_the_raw_count():
+    """Halving a calibration factor must double that channel, and only it."""
+    counts = (1000, 1000, 1000, 8000)
+    base = normalize(*counts, Calibration())
+    tweaked = normalize(*counts, Calibration(wr=0.5))
+    assert tweaked[0] == pytest.approx(base[0] * 2.0)
+    assert tweaked[1:] == pytest.approx(base[1:])
+
+
+def test_calibration_defaults_are_the_identity():
+    """An uncalibrated station must not silently tint every reading."""
+    assert Calibration() == (1.0, 1.0, 1.0)
+    assert Calibration().wr == 1.0
+    counts = (1234, 2345, 3456, 9000)
+    assert normalize(*counts, Calibration()) == pytest.approx(
+        normalize(*counts, Calibration(1.0, 1.0, 1.0))
+    )
+
+
+def test_normalize_clamps_to_the_top_of_the_range():
+    """A channel brighter than Clear, or a small factor, must not exceed 255."""
+    got = normalize(9000, 100, 100, 8000, Calibration())
+    assert got[0] == SRGB_MAX
+    assert normalize(1000, 1000, 1000, 2000, Calibration(wr=0.01))[0] == SRGB_MAX
+
+
+def test_normalize_clamps_to_the_bottom_of_the_range():
+    """Negative counts (sensor offset correction) floor at 0, not below."""
+    got = normalize(-500, 0, 1000, 8000, Calibration())
+    assert got[0] == 0.0
+    assert got[1] == 0.0
+
+
+def test_normalize_output_is_in_srgb_range():
+    """Sweep a grid of plausible readings; nothing may escape 0-255."""
+    cal = Calibration(wr=0.85, wg=1.0, wb=1.3)
+    for c in (1, 500, 20000, 65535):
+        for raw in (0, 1, 250, 12000, 65535):
+            for component in normalize(raw, raw, raw, c, cal):
+                assert 0.0 <= component <= SRGB_MAX
+
+
+def test_normalize_feeds_the_lab_chain():
+    """End to end: counts -> sRGB -> Lab -> LCh on one plausible reading.
+
+    Ties the measurement path together, so a regression that somehow satisfies
+    each piece in isolation still fails here.
+    """
+    # Raw counts whose Clear ratios reproduce #FFA500 under identity cal.
+    rgb = normalize(65535, 42410, 0, 65535, Calibration())
+    assert rgb == pytest.approx((255.0, 165.0, 0.0), abs=0.5)
+    _, chroma, hue = lab_to_lch(*rgb_to_lab(*rgb))
+    assert 60.0 < hue < 85.0
+    assert chroma > 50.0
+
+
+# --- the zero-Clear guard --------------------------------------------------
+
+def test_zero_clear_raises_value_error():
+    """c == 0 is a ValueError, and the message says which channel."""
+    with pytest.raises(ValueError, match="clear"):
+        normalize(100, 200, 300, 0, Calibration())
+
+
+def test_zero_clear_raises_value_error_not_zero_division():
+    """The guard must fire *before* the division, not be a rescue after it.
+
+    ZeroDivisionError is not a subclass of ValueError, so `raises(ValueError)`
+    alone would already catch a missing guard -- but this states the intent
+    explicitly, because the whole point is which exception a station log shows.
+    """
+    with pytest.raises(Exception) as caught:
+        normalize(100, 200, 300, 0, Calibration())
+    assert isinstance(caught.value, ValueError)
+    assert not isinstance(caught.value, ZeroDivisionError)
+
+
+def test_zero_clear_raises_before_touching_calibration():
+    """Structural proof that nothing runs ahead of the guard.
+
+    A tripwire calibration whose factors explode on read: if `normalize` did
+    any part of its arithmetic before validating Clear -- reading a factor,
+    dividing, anything -- this would surface the tripwire's error instead of
+    the ValueError. It is the strongest statement available that the guard is
+    the first thing in the function body.
+    """
+
+    class Tripwire:
+        @property
+        def wr(self):
+            raise AssertionError("calibration read before the Clear guard ran")
+
+        wg = wr
+        wb = wr
+
+    with pytest.raises(ValueError, match="clear"):
+        normalize(100, 200, 300, 0, Tripwire())
+
+
+def test_zero_clear_raises_even_when_all_counts_are_zero():
+    """A fully dark frame is still a refusal, not a 0,0,0 reading."""
+    with pytest.raises(ValueError, match="clear"):
+        normalize(0, 0, 0, 0, Calibration())
+
+
+def test_negative_clear_raises():
+    """Negative Clear is unphysical; refuse it rather than clamping to black."""
+    with pytest.raises(ValueError, match="clear"):
+        normalize(100, 200, 300, -1, Calibration())
+
+
+@pytest.mark.parametrize("cal", [
+    Calibration(wr=0.0),
+    Calibration(wg=0.0),
+    Calibration(wb=0.0),
+    Calibration(wr=-1.0),
+])
+def test_nonpositive_calibration_factor_raises(cal):
+    """A zero factor would divide by zero one line later -- refuse it too."""
+    with pytest.raises(ValueError, match="calibration"):
+        normalize(100, 200, 300, 400, cal)
 
 
 # ---------------------------------------------------------------------------
